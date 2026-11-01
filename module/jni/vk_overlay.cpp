@@ -30,6 +30,7 @@ static std::map<VkSwapchainKHR, SwapInfo> g_swaps;
 static VkInstance g_instance = VK_NULL_HANDLE;
 static VkDevice g_device = VK_NULL_HANDLE;
 static VkPhysicalDevice g_phys = VK_NULL_HANDLE;
+static uint32_t g_queue_family = UINT32_MAX;
 
 static PFN_vkGetInstanceProcAddr orig_gipa = nullptr;
 static PFN_vkGetDeviceProcAddr orig_gdpa = nullptr;
@@ -86,13 +87,16 @@ static bool setup(VkQueue queue, VkSwapchainKHR sc, const SwapInfo &si) {
         dumper::log("vulkan: physical device not found");
         return false;
     }
-    uint32_t family = ImGui_ImplVulkanH_SelectQueueFamilyIndex(g_phys);
+    uint32_t family = (g_queue_family != UINT32_MAX)
+                          ? g_queue_family
+                          : ImGui_ImplVulkanH_SelectQueueFamilyIndex(g_phys);
+    if (family == UINT32_MAX) family = 0;
 
     uint32_t n = 0;
     vkGetSwapchainImagesKHR(g_device, sc, &n, nullptr);
+    if (n == 0) return false;
     std::vector<VkImage> images(n);
     vkGetSwapchainImagesKHR(g_device, sc, &n, images.data());
-    if (n == 0) return false;
 
     VkAttachmentDescription att{};
     att.format = si.format;
@@ -189,6 +193,9 @@ static bool setup(VkQueue queue, VkSwapchainKHR sc, const SwapInfo &si) {
 // Renders the overlay; on success returns true and sets *wait to the semaphore present must wait on.
 static bool render(VkQueue queue, const VkPresentInfoKHR *pi, VkSemaphore *wait) {
     if (g_failed || !g_device) return false;
+    if (!ui::acquire_backend(ui::Backend::Vulkan)) return false;
+    std::lock_guard<std::mutex> render_lock(ui::render_mutex());
+
     VkSwapchainKHR sc = pi->pSwapchains[0];
     SwapInfo si;
     {
@@ -262,6 +269,7 @@ static bool render(VkQueue queue, const VkPresentInfoKHR *pi, VkSemaphore *wait)
 static thread_local bool t_in_present = false;
 
 static VKAPI_ATTR VkResult VKAPI_CALL my_present(VkQueue queue, const VkPresentInfoKHR *pi) {
+    if (!real_present) return VK_ERROR_INITIALIZATION_FAILED;
     if (!t_in_present && pi && pi->swapchainCount == 1) {
         t_in_present = true;
         VkSemaphore wait = VK_NULL_HANDLE;
@@ -288,6 +296,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL my_present(VkQueue queue, const VkPresentI
 static VKAPI_ATTR VkResult VKAPI_CALL my_create_sc(VkDevice dev, const VkSwapchainCreateInfoKHR *ci,
                                                    const VkAllocationCallbacks *a,
                                                    VkSwapchainKHR *out) {
+    if (!real_create_sc) return VK_ERROR_INITIALIZATION_FAILED;
     VkResult r = real_create_sc(dev, ci, a, out);
     if (r == VK_SUCCESS && ci && out) {
         std::lock_guard<std::mutex> l(g_mtx);
@@ -305,12 +314,13 @@ static VKAPI_ATTR void VKAPI_CALL my_destroy_sc(VkDevice dev, VkSwapchainKHR sc,
         if (g_sc == sc) teardown();
         g_swaps.erase(sc);
     }
-    real_destroy_sc(dev, sc, a);
+    if (real_destroy_sc) real_destroy_sc(dev, sc, a);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL my_create_inst(const VkInstanceCreateInfo *ci,
                                                      const VkAllocationCallbacks *a,
                                                      VkInstance *out) {
+    if (!real_create_inst) return VK_ERROR_INITIALIZATION_FAILED;
     VkResult r = real_create_inst(ci, a, out);
     if (r == VK_SUCCESS && out && *out) {
         g_instance = *out;
@@ -323,11 +333,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL my_create_dev(VkPhysicalDevice phys,
                                                     const VkDeviceCreateInfo *ci,
                                                     const VkAllocationCallbacks *a,
                                                     VkDevice *out) {
+    if (!real_create_dev) return VK_ERROR_INITIALIZATION_FAILED;
     VkResult r = real_create_dev(phys, ci, a, out);
     if (r == VK_SUCCESS && out && *out) {
         g_device = *out;
         g_phys = phys;
-        dumper::log("vulkan: device created %p (phys %p)", g_device, g_phys);
+        if (ci && ci->queueCreateInfoCount > 0 && ci->pQueueCreateInfos) {
+            g_queue_family = ci->pQueueCreateInfos[0].queueFamilyIndex;
+        }
+        dumper::log("vulkan: device created %p (phys %p, qfamily %u)", g_device, g_phys, g_queue_family);
     }
     return r;
 }
@@ -350,12 +364,14 @@ static PFN_vkVoidFunction wrap(const char *name, PFN_vkVoidFunction r) {
 }
 
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hook_gipa(VkInstance inst, const char *name) {
+    if (!orig_gipa) return nullptr;
     PFN_vkVoidFunction r = orig_gipa(inst, name);
     if (inst) g_instance = inst;
     return wrap(name, r);
 }
 
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL hook_gdpa(VkDevice dev, const char *name) {
+    if (!orig_gdpa) return nullptr;
     PFN_vkVoidFunction r = orig_gdpa(dev, name);
     if (dev) g_device = dev;
     return wrap(name, r);
@@ -368,28 +384,37 @@ void install() {
             std::this_thread::sleep_for(iter == 0 ? 50ms : 500ms);
             if (real_present) break;
 
-            shadowhook_hook_sym_name("libvulkan.so", "vkQueuePresentKHR",
-                                     reinterpret_cast<void *>(my_present),
-                                     reinterpret_cast<void **>(&real_present));
-            shadowhook_hook_sym_name("libvulkan.so", "vkCreateSwapchainKHR",
-                                     reinterpret_cast<void *>(my_create_sc),
-                                     reinterpret_cast<void **>(&real_create_sc));
-            shadowhook_hook_sym_name("libvulkan.so", "vkDestroySwapchainKHR",
-                                     reinterpret_cast<void *>(my_destroy_sc),
-                                     reinterpret_cast<void **>(&real_destroy_sc));
-            shadowhook_hook_sym_name("libvulkan.so", "vkCreateInstance",
-                                     reinterpret_cast<void *>(my_create_inst),
-                                     reinterpret_cast<void **>(&real_create_inst));
-            shadowhook_hook_sym_name("libvulkan.so", "vkCreateDevice",
-                                     reinterpret_cast<void *>(my_create_dev),
-                                     reinterpret_cast<void **>(&real_create_dev));
+            // Use UNIQUE mode so functions work identically whether entered via inline hook
+            // on libvulkan.so or via wrapped pointers returned by vkGet{Instance,Device}ProcAddr.
+            shadowhook_hook_sym_name_2("libvulkan.so", "vkQueuePresentKHR",
+                                       reinterpret_cast<void *>(my_present),
+                                       reinterpret_cast<void **>(&real_present),
+                                       SHADOWHOOK_HOOK_WITH_UNIQUE_MODE);
+            shadowhook_hook_sym_name_2("libvulkan.so", "vkCreateSwapchainKHR",
+                                       reinterpret_cast<void *>(my_create_sc),
+                                       reinterpret_cast<void **>(&real_create_sc),
+                                       SHADOWHOOK_HOOK_WITH_UNIQUE_MODE);
+            shadowhook_hook_sym_name_2("libvulkan.so", "vkDestroySwapchainKHR",
+                                       reinterpret_cast<void *>(my_destroy_sc),
+                                       reinterpret_cast<void **>(&real_destroy_sc),
+                                       SHADOWHOOK_HOOK_WITH_UNIQUE_MODE);
+            shadowhook_hook_sym_name_2("libvulkan.so", "vkCreateInstance",
+                                       reinterpret_cast<void *>(my_create_inst),
+                                       reinterpret_cast<void **>(&real_create_inst),
+                                       SHADOWHOOK_HOOK_WITH_UNIQUE_MODE);
+            shadowhook_hook_sym_name_2("libvulkan.so", "vkCreateDevice",
+                                       reinterpret_cast<void *>(my_create_dev),
+                                       reinterpret_cast<void **>(&real_create_dev),
+                                       SHADOWHOOK_HOOK_WITH_UNIQUE_MODE);
 
-            shadowhook_hook_sym_name("libvulkan.so", "vkGetInstanceProcAddr",
-                                     reinterpret_cast<void *>(hook_gipa),
-                                     reinterpret_cast<void **>(&orig_gipa));
-            shadowhook_hook_sym_name("libvulkan.so", "vkGetDeviceProcAddr",
-                                     reinterpret_cast<void *>(hook_gdpa),
-                                     reinterpret_cast<void **>(&orig_gdpa));
+            shadowhook_hook_sym_name_2("libvulkan.so", "vkGetInstanceProcAddr",
+                                       reinterpret_cast<void *>(hook_gipa),
+                                       reinterpret_cast<void **>(&orig_gipa),
+                                       SHADOWHOOK_HOOK_WITH_UNIQUE_MODE);
+            shadowhook_hook_sym_name_2("libvulkan.so", "vkGetDeviceProcAddr",
+                                       reinterpret_cast<void *>(hook_gdpa),
+                                       reinterpret_cast<void **>(&orig_gdpa),
+                                       SHADOWHOOK_HOOK_WITH_UNIQUE_MODE);
 
             if (real_present) {
                 dumper::log("vulkan: successfully hooked vkQueuePresentKHR");

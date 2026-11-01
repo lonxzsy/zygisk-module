@@ -7,9 +7,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <fstream>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -31,7 +33,7 @@ static thread_local bool t_in_swap = false;
 
 static void on_frame(EGLDisplay dpy, EGLSurface surf) {
     EGLContext ctx = eglGetCurrentContext();
-    if (ctx == EGL_NO_CONTEXT) return;
+    if (ctx == EGL_NO_CONTEXT || surf == EGL_NO_SURFACE) return;
 
     GLint vp[4] = {};
     glGetIntegerv(GL_VIEWPORT, vp);
@@ -42,6 +44,10 @@ static void on_frame(EGLDisplay dpy, EGLSurface surf) {
     }
 
     if (w < 100 || h < 100) return;
+
+    // Prevent GLES and Vulkan from racing on the global ImGui context
+    if (!ui::acquire_backend(ui::Backend::GLES)) return;
+    std::lock_guard<std::mutex> render_lock(ui::render_mutex());
 
     if (g_init && ctx != g_ctx) {
         dumper::log("EGL: context changed (%p -> %p), reinitializing", g_ctx, ctx);
@@ -54,14 +60,18 @@ static void on_frame(EGLDisplay dpy, EGLSurface surf) {
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
         ui::init_style();
-        ImGui_ImplOpenGL3_Init("#version 300 es");
+        EGLint client_ver = 3;
+        eglQueryContext(dpy, ctx, EGL_CONTEXT_CLIENT_VERSION, &client_ver);
+        const char *glsl_ver = (client_ver >= 3) ? "#version 300 es" : "#version 100";
+        ImGui_ImplOpenGL3_Init(glsl_ver);
         g_ctx = ctx;
         g_init = true;
-        dumper::log("EGL: ImGui overlay initialized for ctx %p (%dx%d)", ctx, w, h);
+        dumper::log("EGL: ImGui overlay initialized for ctx %p (GLES %d, %dx%d)",
+                    ctx, (int)client_ver, w, h);
     }
 
     g_swap_count++;
-    if (g_swap_count <= 10 || g_swap_count % 60 == 1) {
+    if (g_swap_count <= 5 || g_swap_count % 300 == 1) {
         GLint cur_fbo = 0;
         glGetIntegerv(GL_FRAMEBUFFER_BINDING, &cur_fbo);
         dumper::log("EGL present heartbeat: frame %llu, %dx%d, ctx %p, fbo %d",
@@ -76,7 +86,9 @@ static void on_frame(EGLDisplay dpy, EGLSurface surf) {
     GLboolean last_cull = glIsEnabled(GL_CULL_FACE);
     GLboolean last_depth = glIsEnabled(GL_DEPTH_TEST);
     GLboolean last_stencil = glIsEnabled(GL_STENCIL_TEST);
-    GLint last_viewport[4];
+    GLboolean last_color_mask[4] = {GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE};
+    glGetBooleanv(GL_COLOR_WRITEMASK, last_color_mask);
+    GLint last_viewport[4] = {};
     glGetIntegerv(GL_VIEWPORT, last_viewport);
 
     // Apply overlay state
@@ -96,6 +108,7 @@ static void on_frame(EGLDisplay dpy, EGLSurface surf) {
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
     // Restore OpenGL states
+    glColorMask(last_color_mask[0], last_color_mask[1], last_color_mask[2], last_color_mask[3]);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, last_draw_fbo);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, last_read_fbo);
     glViewport(last_viewport[0], last_viewport[1], last_viewport[2], last_viewport[3]);
@@ -105,7 +118,7 @@ static void on_frame(EGLDisplay dpy, EGLSurface surf) {
     if (last_stencil) glEnable(GL_STENCIL_TEST);
 
     // Clear any OpenGL errors so game loop won't see them
-    while (glGetError() != GL_NO_ERROR);
+    while (glGetError() != GL_NO_ERROR) {}
 }
 
 // -----------------------------------------------------------------------------
@@ -231,6 +244,7 @@ static bool is_graphics_library(const std::string &base) {
     if (lower.find("mali") != std::string::npos) return true;
     if (lower.find("unity") != std::string::npos) return true;
     if (lower.find("ue4") != std::string::npos) return true;
+    if (lower.find("unreal") != std::string::npos) return true;
     return false;
 }
 
@@ -246,7 +260,7 @@ static void try_hook(std::set<std::pair<std::string, std::string>> &hooked,
     } else {
         int err = shadowhook_get_errno();
         if (err != SHADOWHOOK_ERRNO_PENDING && err != SHADOWHOOK_ERRNO_NOT_FOUND) {
-            hooked.insert(key); // Don't spam retries on fatal errors
+            hooked.insert(key);  // Don't spam retries on fatal errors
         }
     }
 }
@@ -276,7 +290,8 @@ void install(JNIEnv *env) {
             "libGLES_mali.so",
             "libmali.so",
             "libunity.so",
-            "libUE4.so"
+            "libUE4.so",
+            "libUnreal.so"
         };
 
         // Continuous monitoring loop:
@@ -293,8 +308,8 @@ void install(JNIEnv *env) {
             // Also inspect all dynamically loaded libraries via /proc/self/maps
             std::vector<LoadedLib> loaded = get_loaded_libraries();
             for (const auto &lib : loaded) {
-                if (lib.name == "libunity.so" && lib.base != 0) {
-                    input::hook_unity(lib.path.c_str(), lib.base);
+                if (lib.name == "libunity.so") {
+                    input::hook_unity();
                 }
                 if (!is_graphics_library(lib.name)) continue;
                 try_hook(hooked, lib.name, "eglSwapBuffers", reinterpret_cast<void *>(hook_swap_sh));

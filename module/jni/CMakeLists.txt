@@ -23,7 +23,7 @@ list(FILTER SH_SRC EXCLUDE REGEX "sh_jni\\.c$")
 add_library(shadowhook_static STATIC ${SH_SRC})
 target_include_directories(shadowhook_static PRIVATE ${SH} ${SH}/include ${SH}/arch/${SH_ARCH}
     ${SH}/common ${SH}/third_party/xdl ${SH}/third_party/bsd ${SH}/third_party/lss)
-target_compile_options(shadowhook_static PRIVATE -Os -w)
+target_compile_options(shadowhook_static PRIVATE -Os -w -ffunction-sections -fdata-sections)
 target_link_libraries(shadowhook_static log)
 
 # ---------------- Dear ImGui ----------------
@@ -34,12 +34,12 @@ add_library(imgui_static STATIC
     ${IMGUI}/backends/imgui_impl_vulkan.cpp)
 target_include_directories(imgui_static PUBLIC ${IMGUI} ${IMGUI}/backends)
 target_compile_definitions(imgui_static PUBLIC IMGUI_IMPL_OPENGL_ES3)
-target_compile_options(imgui_static PRIVATE -Os -w)
+target_compile_options(imgui_static PRIVATE -Os -w -ffunction-sections -fdata-sections)
 
 # ---------------- Module ----------------
 add_library(il2cppdumper SHARED
     main.cpp config.cpp il2cpp_dumper.cpp ue4_dumper.cpp overlay.cpp ui.cpp input_hook.cpp vk_overlay.cpp)
 target_include_directories(il2cppdumper PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${SH}/include)
-target_compile_options(il2cppdumper PRIVATE -fvisibility=hidden -Wall)
+target_compile_options(il2cppdumper PRIVATE -fvisibility=hidden -Wall -Wextra -Wno-missing-field-initializers -Os -ffunction-sections -fdata-sections)
 target_link_libraries(il2cppdumper shadowhook_static imgui_static log android EGL GLESv3 vulkan dl)
-target_link_options(il2cppdumper PRIVATE -Wl,-z,max-page-size=16384 -Wl,--gc-sections)
+target_link_options(il2cppdumper PRIVATE -Wl,-z,max-page-size=16384 -Wl,--gc-sections -Wl,-s)

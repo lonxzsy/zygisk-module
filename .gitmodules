@@ -1,0 +1,6 @@
+[submodule "module/jni/external/imgui"]
+	path = module/jni/external/imgui
+	url = https://github.com/ocornut/imgui.git
+[submodule "module/jni/external/shadowhook_src"]
+	path = module/jni/external/shadowhook_src
+	url = https://github.com/bytedance/android-inline-hook.git

@@ -1,9 +1,18 @@
 # Target process (package) names - one "package=" line per game.
+# Auxiliary subprocesses (:push, :webview, :crashpad, etc.) are ignored automatically.
 # package=com.example.game
 
 # Output root. "auto" = /sdcard/Android/data/<package>/files/il2cpp_dump
 output=auto
 
+# Engine & Runtime options:
+# engine=auto                      # auto | unity | ue4
+# custom_lib=                      # optional if game renamed libil2cpp.so / libUE4.so (e.g. libGame.so)
+auto_dump=1                        # 1 = dump automatically on startup, 0 = manual via [Dump Now] button
+overlay=1                          # 1 = show ImGui overlay (GLES/Vulkan), 0 = headless mode
+init_delay_ms=5000                 # initial wait time before automatic dump
+
+# Dump outputs:
 dump_cs=1
 dump_script_json=1
 dump_metadata=1
@@ -18,7 +27,7 @@ dump_so=1
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Unreal Engine 4 only. 0 = auto-detect (slower, scans libUE4.so .bss).
+# Unreal Engine 4 / 5 only. 0 = auto-detect (scans libUE4.so / libUnreal.so .bss).
 # Fill these in when the overlay stays on "Dumping..." and dump.log says the
 # structures were not found. Offsets can be RVAs from libUE4.so base
 # (e.g. 0x4B7C3C0) or absolute VAs - detected automatically.
@@ -36,7 +45,7 @@ dump_so=1
 # ue4_elements_per_chunk=65536
 # ue4_num_elements=0               # object count if the array header is odd
 
-# Optional UObject / UStruct member offsets (0 = auto-calibrate):
+# Optional UObject / UStruct / UFunction member offsets (0 = auto-calibrate):
 # ue4_off_internal_index=0x0C
 # ue4_off_class=0x10
 # ue4_off_name=0x18
@@ -46,4 +55,5 @@ dump_so=1
 # ue4_off_child_props=0x50
 # ue4_off_properties_size=0x58
 # ue4_off_prop_offset=0x4C
-# ue4_use_ffield=0                 # 0 = UField (<4.25), 1 = FField (4.25+)
+# ue4_off_func=0xB0
+# ue4_use_ffield=0                 # 0 = UField (<4.25), 1 = FField (4.25+ / UE5)

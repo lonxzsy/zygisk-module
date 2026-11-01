@@ -97,6 +97,14 @@ static bool is_readable(uintptr_t addr, size_t len = sizeof(uintptr_t)) {
     return false;
 }
 
+static bool is_ue4_code_ptr(uintptr_t addr) {
+#if defined(__aarch64__)
+    addr &= 0x00FFFFFFFFFFFFFFULL;
+#endif
+    if (!g_lib_base || !g_lib_size) return false;
+    return addr >= g_lib_base && addr < g_lib_base + g_lib_size;
+}
+
 template <typename T>
 static bool read_val(uintptr_t addr, T &out) {
     if (!is_readable(addr, sizeof(T))) return false;
@@ -113,6 +121,16 @@ static bool is_valid_ascii_name(const char *s, int max_len = 64) {
     return false;
 }
 
+static std::string json_escape(const std::string &s) {
+    std::string o;
+    for (char c : s) {
+        if (c == '"' || c == '\\') { o += '\\'; o += c; }
+        else if ((unsigned char)c < 0x20) o += ' ';
+        else o += c;
+    }
+    return o;
+}
+
 // ------------------------------------------------------------------ GNames Structures
 enum class GNamesMode { None, FNamePool, TNameEntryArray };
 
@@ -122,7 +140,7 @@ struct GNamesProfile {
     uintptr_t blocks_array_va = 0;  // Address of Blocks[] or Chunks[] array
     uint32_t num_blocks = 0;
 
-    // For FNamePool (UE 4.23+)
+    // For FNamePool (UE 4.23+ / UE5)
     uint32_t pool_stride = 2;       // Alignment stride (usually 2 or 4)
     uint32_t header_offset = 0;     // Offset of 2-byte header before string
     uint32_t string_offset = 2;     // Offset of string inside FNameEntry
@@ -275,7 +293,7 @@ static bool probe_tnameentry_chunks(uintptr_t chunks_va, GNamesProfile &prof) {
 }
 
 static bool detect_gnames() {
-    // 1. Scan libUE4.so writable (.data / .bss) segments
+    // 1. Scan libUE4.so / libUnreal.so writable (.data / .bss) segments
     for (const auto &rw : g_ue4_rw) {
         for (uintptr_t p = rw.start; p + sizeof(uintptr_t) <= rw.end; p += sizeof(uintptr_t)) {
             uintptr_t val = 0;
@@ -286,19 +304,13 @@ static bool detect_gnames() {
             if (probe_fnamepool_block0(val, prof)) {
                 prof.gnames_va = p - 16; // Lock (8) + CurrentBlock (4) + CurrentByteCursor (4)
                 prof.blocks_array_va = p;
-                uint32_t nb = 0;
-                for (uint32_t b = 0; b < 8192; ++b) {
-                    uintptr_t bp = 0;
-                    if (!read_val(p + b * sizeof(uintptr_t), bp) || !is_readable(bp, 64)) break;
-                    nb++;
-                }
-                prof.num_blocks = nb;
+                prof.num_blocks = count_name_blocks(p);
                 g_names = prof;
-                dumper::log("[UE4] Detected GNames structure: FNamePool (UE 4.23+)");
+                dumper::log("[UE4] Detected GNames structure: FNamePool (UE 4.23+ / UE5)");
                 dumper::log("[UE4] FNamePool Blocks VA: 0x%llx (RVA: 0x%llx), Blocks: %u, shift: %u, stride: %u",
                             (unsigned long long)p,
                             (unsigned long long)(p - g_lib_base),
-                            nb, prof.len_shift, prof.pool_stride);
+                            prof.num_blocks, prof.len_shift, prof.pool_stride);
                 return true;
             }
 
@@ -484,6 +496,7 @@ struct UObjectProfile {
     uint32_t off_class_private  = sizeof(uintptr_t) == 8 ? 0x10 : 0x0C;
     uint32_t off_name_private   = sizeof(uintptr_t) == 8 ? 0x18 : 0x10;
     uint32_t off_outer_private  = sizeof(uintptr_t) == 8 ? 0x20 : 0x18;
+    bool fname_has_number       = true;  // false when UE_FNAME_OUTLINE_NUMBER=1 (UE5 / UE4.26+)
 
     // Calibrated UStruct / Property member offsets
     bool struct_calibrated = false;
@@ -501,6 +514,9 @@ struct UObjectProfile {
     uint32_t off_ffield_next     = sizeof(uintptr_t) == 8 ? 0x20 : 0x10;
     uint32_t off_ffield_name     = sizeof(uintptr_t) == 8 ? 0x28 : 0x14;
     uint32_t off_fprop_offset    = sizeof(uintptr_t) == 8 ? 0x4C : 0x30;
+
+    // Calibrated UFunction::Func (native function pointer)
+    uint32_t off_ufunc_ptr       = 0;
 };
 
 static UObjectProfile g_uobj;
@@ -554,20 +570,35 @@ static bool verify_uobject_array_items(uintptr_t first_chunk, UObjectProfile &pr
                 prof.off_internal_index = ioff;
                 prof.off_class_private = (ioff + 4 + (sizeof(uintptr_t) - 1)) & ~(sizeof(uintptr_t) - 1);
                 prof.off_name_private = prof.off_class_private + sizeof(uintptr_t);
-                prof.off_outer_private = prof.off_name_private + 8; // FName is 8 bytes (ComparisonIndex + Number)
+                prof.off_outer_private = prof.off_name_private + 8;
 
                 // Double check FName of obj0 resolves to a valid ASCII name
                 uint32_t name_idx0 = 0;
                 if (read_val(obj0 + prof.off_name_private, name_idx0)) {
                     std::string n0 = get_name_by_index(name_idx0);
                     if (n0.empty() && read_val(obj0 + prof.off_name_private + 8, name_idx0)) {
-                        // In case FName has CasePreservingIndex (12-16 bytes) or Class/Name swapped
+                        // In case FName has CasePreservingIndex or Class/Name swapped
                         std::string n_alt = get_name_by_index(name_idx0);
                         if (!n_alt.empty()) {
                             prof.off_name_private += 8;
                             prof.off_outer_private += 8;
                         }
                     }
+                }
+
+                // Check if FName has an inline Number (8 bytes) or outline number (4 bytes in UE5):
+                // Core engine objects obj0..obj3 have Number == 0 when inline Number is present.
+                int32_t num0 = 0, num1 = 0;
+                read_val(obj0 + prof.off_name_private + 4, num0);
+                read_val(obj1 + prof.off_name_private + 4, num1);
+                if (num0 != 0 || num1 != 0) {
+                    prof.fname_has_number = false;
+                    // On 32-bit, OuterPrivate follows a 4-byte FName at +4; on 64-bit, aligned to +8
+                    if (sizeof(uintptr_t) == 4) {
+                        prof.off_outer_private = prof.off_name_private + 4;
+                    }
+                } else {
+                    prof.fname_has_number = true;
                 }
                 return true;
             }
@@ -767,22 +798,33 @@ static void apply_manual_uobject_offsets(const Config &cfg) {
     if (cfg.ue4_off_children) { g_uobj.off_children = cfg.ue4_off_children; n++; }
     if (cfg.ue4_off_child_props) { g_uobj.off_child_props = cfg.ue4_off_child_props; n++; }
     if (cfg.ue4_off_properties_size) { g_uobj.off_properties_size = cfg.ue4_off_properties_size; n++; }
-    if (cfg.ue4_off_prop_offset) { g_uobj.off_fprop_offset = cfg.ue4_off_prop_offset; n++; }
+    if (cfg.ue4_off_prop_offset) { g_uobj.off_fprop_offset = cfg.ue4_off_prop_offset; g_uobj.off_uprop_offset = cfg.ue4_off_prop_offset; n++; }
+    if (cfg.ue4_off_func) { g_uobj.off_ufunc_ptr = cfg.ue4_off_func; n++; }
     if (cfg.ue4_use_ffield >= 0) { g_uobj.use_ffield = cfg.ue4_use_ffield != 0; n++; }
     if (n) dumper::log("[UE4] Applied %d manual UObject/UStruct offset(s) from config.txt", n);
 }
 
-
 // ------------------------------------------------------------------ Object Helpers & Calibration
+// Base name without _Number suffix (safe for comparing against "Class", "ScriptStruct", "Function", etc.)
+static std::string get_object_base_name(uintptr_t obj) {
+    if (!obj) return "";
+    uint32_t name_idx = 0;
+    if (!read_val(obj + g_uobj.off_name_private, name_idx)) return "";
+    return get_name_by_index(name_idx);
+}
+
 static std::string get_object_name(uintptr_t obj) {
     if (!obj) return "";
     uint32_t name_idx = 0;
-    int32_t number = 0;
     if (!read_val(obj + g_uobj.off_name_private, name_idx)) return "";
-    read_val(obj + g_uobj.off_name_private + 4, number);
     std::string base = get_name_by_index(name_idx);
     if (base.empty()) return "";
-    if (number > 0) base += "_" + std::to_string(number - 1);
+    if (g_uobj.fname_has_number) {
+        int32_t number = 0;
+        if (read_val(obj + g_uobj.off_name_private + 4, number) && number > 0 && number < 100000) {
+            base += "_" + std::to_string(number - 1);
+        }
+    }
     return base;
 }
 
@@ -816,13 +858,14 @@ static std::string get_full_name(uintptr_t obj) {
 static void calibrate_ustruct_offsets() {
     uintptr_t uclass_obj = 0, ustruct_obj = 0, ufield_obj = 0, uobject_obj = 0;
     uintptr_t vec_struct = 0, color_struct = 0;
+    std::vector<uintptr_t> sample_funcs;
 
-    int32_t limit = std::min<int32_t>(g_uobj.num_elements, 25000);
+    int32_t limit = std::min<int32_t>(g_uobj.num_elements, 30000);
     for (int32_t i = 0; i < limit; ++i) {
         uintptr_t obj = get_uobject_by_index(i);
         if (!obj) continue;
-        std::string name = get_object_name(obj);
-        std::string cls_name = get_object_name(get_object_class(obj));
+        std::string name = get_object_base_name(obj);
+        std::string cls_name = get_object_base_name(get_object_class(obj));
         if (cls_name == "Class") {
             if (name == "Object" && !uobject_obj) uobject_obj = obj;
             else if (name == "Field" && !ufield_obj) ufield_obj = obj;
@@ -831,8 +874,11 @@ static void calibrate_ustruct_offsets() {
         } else if (cls_name == "ScriptStruct") {
             if (name == "Vector" && !vec_struct) vec_struct = obj;
             else if (name == "Color" && !color_struct) color_struct = obj;
+        } else if (cls_name == "Function" && sample_funcs.size() < 8) {
+            sample_funcs.push_back(obj);
         }
-        if (uclass_obj && ustruct_obj && ufield_obj && uobject_obj && vec_struct && color_struct)
+        if (uclass_obj && ustruct_obj && ufield_obj && uobject_obj &&
+            vec_struct && color_struct && sample_funcs.size() >= 4)
             break;
     }
 
@@ -850,14 +896,15 @@ static void calibrate_ustruct_offsets() {
         }
     }
 
-    // 2. Calibrate UStruct::PropertiesSize using Vector (12 bytes) and Color (4 bytes)
+    // 2. Calibrate UStruct::PropertiesSize using Vector (12 or 24 bytes in UE5 double-precision) and Color (4 bytes)
     if (vec_struct && color_struct) {
         for (uint32_t off = g_uobj.off_super_struct + sizeof(uintptr_t); off <= 0xB0; off += 4) {
             int32_t vsz = 0, csz = 0;
-            if (read_val(vec_struct + off, vsz) && vsz == 12 &&
+            if (read_val(vec_struct + off, vsz) && (vsz == 12 || vsz == 24) &&
                 read_val(color_struct + off, csz) && csz == 4) {
                 g_uobj.off_properties_size = off;
-                dumper::log("[UE4] Calibrated UStruct::PropertiesSize offset = 0x%x", off);
+                dumper::log("[UE4] Calibrated UStruct::PropertiesSize offset = 0x%x (Vector=%d, Color=%d)",
+                            off, vsz, csz);
                 break;
             }
         }
@@ -869,8 +916,8 @@ static void calibrate_ustruct_offsets() {
             uintptr_t child = 0;
             if (!read_val(vec_struct + off, child) || !is_readable(child, 64)) continue;
 
-            // Check if 'child' is a UObject (UField / UProperty in UE 4.18 - 4.24)
-            std::string u_name = get_object_name(child);
+            // Check if 'child' is a UObject (UField / UProperty in UE 4.11 - 4.24)
+            std::string u_name = get_object_base_name(child);
             if (u_name == "X" || u_name == "Y" || u_name == "Z") {
                 g_uobj.use_ffield = false;
                 g_uobj.off_children = off;
@@ -878,23 +925,24 @@ static void calibrate_ustruct_offsets() {
                 break;
             }
 
-            // Check if 'child' is an FField (UE 4.25+) by looking for FName "X" inside child
-            for (uint32_t f_name_off = 0x18; f_name_off <= 0x38; f_name_off += 4) {
+            // Check if 'child' is an FField (UE 4.25+ / UE5) by looking for FName "X" inside child
+            for (uint32_t f_name_off = 0x10; f_name_off <= 0x38; f_name_off += 4) {
                 uint32_t f_idx = 0;
                 if (read_val(child + f_name_off, f_idx)) {
                     std::string fn = get_name_by_index(f_idx);
                     if (fn == "X") {
                         g_uobj.use_ffield = true;
                         g_uobj.off_child_props = off;
+                        g_uobj.off_children = off - sizeof(uintptr_t);
                         g_uobj.off_ffield_name = f_name_off;
                         g_uobj.off_ffield_next = f_name_off - sizeof(uintptr_t);
-                        // Find Offset_Internal in second field ("Y" -> offset 4)
+                        // Find Offset_Internal in second field ("Y" -> offset 4 for float, or 8 for UE5 double)
                         uintptr_t next_field = 0;
                         if (read_val(child + g_uobj.off_ffield_next, next_field) && is_readable(next_field, 96)) {
                             for (uint32_t poff = f_name_off + 8; poff <= 0x68; poff += 4) {
                                 int32_t x_off = -1, y_off = -1;
                                 if (read_val(child + poff, x_off) && x_off == 0 &&
-                                    read_val(next_field + poff, y_off) && y_off == 4) {
+                                    read_val(next_field + poff, y_off) && (y_off == 4 || y_off == 8)) {
                                     g_uobj.off_fprop_offset = poff;
                                     break;
                                 }
@@ -909,6 +957,25 @@ static void calibrate_ustruct_offsets() {
             if (g_uobj.use_ffield) break;
         }
     }
+
+    // 4. Calibrate UFunction::Func (native code pointer into libUE4.so / libUnreal.so)
+    if (!sample_funcs.empty() && g_lib_base && g_lib_size) {
+        uint32_t start_off = g_uobj.off_properties_size + 0x18;
+        for (uint32_t off = start_off; off <= 0x110; off += sizeof(uintptr_t)) {
+            int hits = 0;
+            for (uintptr_t fn_obj : sample_funcs) {
+                uintptr_t code_ptr = 0;
+                if (read_val(fn_obj + off, code_ptr) && is_ue4_code_ptr(code_ptr)) {
+                    hits++;
+                }
+            }
+            if (hits >= (int)std::min<size_t>(2, sample_funcs.size())) {
+                g_uobj.off_ufunc_ptr = off;
+                dumper::log("[UE4] Calibrated UFunction::Func native pointer offset = 0x%x", off);
+                break;
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------ Dump Routines
@@ -917,15 +984,15 @@ static void dump_offsets_info(const std::string &out_dir) {
     if (!f) return;
 
     fprintf(f, "========================================================\n");
-    fprintf(f, "  Universal Unreal Engine 4 Dump Info\n");
+    fprintf(f, "  Universal Unreal Engine 4 / 5 Dump Info\n");
     fprintf(f, "========================================================\n");
-    fprintf(f, "libUE4.so Base : 0x%llx\n", (unsigned long long)g_lib_base);
-    fprintf(f, "libUE4.so Size : 0x%zx\n\n", g_lib_size);
+    fprintf(f, "Engine Lib Base : 0x%llx\n", (unsigned long long)g_lib_base);
+    fprintf(f, "Engine Lib Size : 0x%zx\n\n", g_lib_size);
 
     fprintf(f, "[GNames]\n");
     fprintf(f, "  Source       : %s\n", g_manual_gnames ? "config.txt (manual)" : "auto-detected");
     fprintf(f, "  Structure    : %s\n",
-            g_names.mode == GNamesMode::FNamePool ? "FNamePool (UE 4.23+)" :
+            g_names.mode == GNamesMode::FNamePool ? "FNamePool (UE 4.23+ / UE5)" :
             g_names.mode == GNamesMode::TNameEntryArray ? "TNameEntryArray (UE 4.11-4.22)" : "Unknown");
     fprintf(f, "  GNames VA    : 0x%llx\n", (unsigned long long)g_names.gnames_va);
     fprintf(f, "  GNames RVA   : 0x%llx\n", (unsigned long long)(g_names.gnames_va - g_lib_base));
@@ -947,17 +1014,20 @@ static void dump_offsets_info(const std::string &out_dir) {
     fprintf(f, "[Calibrated UObject & UStruct Offsets]\n");
     fprintf(f, "  UObject::InternalIndex    : 0x%x\n", g_uobj.off_internal_index);
     fprintf(f, "  UObject::ClassPrivate     : 0x%x\n", g_uobj.off_class_private);
-    fprintf(f, "  UObject::NamePrivate      : 0x%x\n", g_uobj.off_name_private);
+    fprintf(f, "  UObject::NamePrivate      : 0x%x (%s)\n", g_uobj.off_name_private,
+            g_uobj.fname_has_number ? "8-byte FName" : "4-byte FName / Outline Number");
     fprintf(f, "  UObject::OuterPrivate     : 0x%x\n", g_uobj.off_outer_private);
     fprintf(f, "  UStruct::SuperStruct      : 0x%x\n", g_uobj.off_super_struct);
+    fprintf(f, "  UStruct::Children         : 0x%x\n", g_uobj.off_children);
     fprintf(f, "  UStruct::PropertiesSize   : 0x%x\n", g_uobj.off_properties_size);
     if (g_uobj.use_ffield) {
         fprintf(f, "  UStruct::ChildProperties  : 0x%x (FField mode)\n", g_uobj.off_child_props);
         fprintf(f, "  FField::Next              : 0x%x\n", g_uobj.off_ffield_next);
         fprintf(f, "  FField::Name              : 0x%x\n", g_uobj.off_ffield_name);
         fprintf(f, "  FProperty::Offset         : 0x%x\n", g_uobj.off_fprop_offset);
-    } else {
-        fprintf(f, "  UStruct::Children         : 0x%x (UField mode)\n", g_uobj.off_children);
+    }
+    if (g_uobj.off_ufunc_ptr) {
+        fprintf(f, "  UFunction::Func           : 0x%x\n", g_uobj.off_ufunc_ptr);
     }
     fclose(f);
 }
@@ -1014,27 +1084,36 @@ static size_t dump_names(const std::string &out_dir) {
     return count;
 }
 
-static size_t dump_objects_and_sdk(const std::string &out_dir, size_t &out_classes) {
+static size_t dump_objects_and_sdk(const Config &cfg, const std::string &out_dir,
+                                   size_t &out_classes, size_t &out_funcs) {
     FILE *fobj = fopen((out_dir + "/ObjectsDump.txt").c_str(), "w");
-    FILE *fsdk = fopen((out_dir + "/SDK_Dump.hpp").c_str(), "w");
+    FILE *fsdk = cfg.dump_cs ? fopen((out_dir + "/SDK_Dump.hpp").c_str(), "w") : nullptr;
+    FILE *ffn  = fopen((out_dir + "/FunctionsDump.txt").c_str(), "w");
+    FILE *fjs  = cfg.dump_script_json ? fopen((out_dir + "/script.json").c_str(), "w") : nullptr;
+    bool first_js = true;
+    if (fjs) fprintf(fjs, "{\"ScriptMethod\":[\n");
+
     size_t obj_count = 0;
     out_classes = 0;
+    out_funcs = 0;
 
     if (fsdk) {
-        fprintf(fsdk, "// Auto-Generated UE4 SDK Dump\n");
-        fprintf(fsdk, "// libUE4.so base: 0x%llx\n\n", (unsigned long long)g_lib_base);
+        fprintf(fsdk, "// Auto-Generated Unreal Engine (UE4/UE5) SDK Dump\n");
+        fprintf(fsdk, "// Engine lib base: 0x%llx\n\n", (unsigned long long)g_lib_base);
     }
 
     int32_t total = std::min<int32_t>(g_uobj.num_elements, 2000000);
     for (int32_t i = 0; i < total; ++i) {
         if ((i % 50000) == 0) {
-            dumper::set_status_detail("UE4: objects %d/%d (%zu dumped, %zu classes)", i, total, obj_count, out_classes);
+            dumper::set_status_detail("UE4: objects %d/%d (%zu dumped, %zu classes, %zu funcs)",
+                                      i, total, obj_count, out_classes, out_funcs);
             if (i) dumper::log("[UE4] objects progress: %d/%d (%zu dumped)", i, total, obj_count);
         }
         uintptr_t obj = get_uobject_by_index(i);
         if (!obj || !is_readable(obj, 64)) continue;
 
         uintptr_t cls = get_object_class(obj);
+        std::string cls_base = get_object_base_name(cls);
         std::string cls_name = get_object_name(cls);
         std::string full_name = get_full_name(obj);
         if (cls_name.empty() && full_name.empty()) continue;
@@ -1045,8 +1124,33 @@ static size_t dump_objects_and_sdk(const std::string &out_dir, size_t &out_class
         }
         obj_count++;
 
+        // Record standalone UFunction RVA into FunctionsDump.txt and script.json
+        if (cls_base == "Function") {
+            uintptr_t fn_va = 0;
+            if (g_uobj.off_ufunc_ptr) read_val(obj + g_uobj.off_ufunc_ptr, fn_va);
+#if defined(__aarch64__)
+            fn_va &= 0x00FFFFFFFFFFFFFFULL;
+#endif
+            bool valid_code = is_ue4_code_ptr(fn_va);
+            uintptr_t rva = valid_code ? (fn_va - g_lib_base) : 0;
+            if (ffn) {
+                fprintf(ffn, "[%06d] RVA: 0x%08llx  VA: 0x%llx  %s\n",
+                        i, (unsigned long long)rva, (unsigned long long)fn_va, full_name.c_str());
+            }
+            if (fjs && valid_code) {
+                fprintf(fjs, "%s{\"Address\":%llu,\"Name\":\"%s\",\"Signature\":\"void %s()\"}",
+                        first_js ? "" : ",\n",
+                        (unsigned long long)rva,
+                        json_escape(full_name).c_str(),
+                        json_escape(full_name).c_str());
+                first_js = false;
+            }
+            out_funcs++;
+            continue;
+        }
+
         // If this object is a Class or ScriptStruct, emit SDK layout
-        if (fsdk && (cls_name == "Class" || cls_name == "ScriptStruct")) {
+        if (fsdk && (cls_base == "Class" || cls_base == "ScriptStruct")) {
             std::string sname = get_object_name(obj);
             uintptr_t super = 0;
             read_val(obj + g_uobj.off_super_struct, super);
@@ -1054,7 +1158,7 @@ static size_t dump_objects_and_sdk(const std::string &out_dir, size_t &out_class
             int32_t prop_sz = 0;
             read_val(obj + g_uobj.off_properties_size, prop_sz);
 
-            fprintf(fsdk, "// %s %s (Size: 0x%x)\n", cls_name.c_str(), full_name.c_str(), prop_sz);
+            fprintf(fsdk, "// %s %s (Size: 0x%x)\n", cls_base.c_str(), full_name.c_str(), prop_sz);
             if (!super_name.empty())
                 fprintf(fsdk, "struct %s : public %s {\n", sname.c_str(), super_name.c_str());
             else
@@ -1071,7 +1175,6 @@ static size_t dump_objects_and_sdk(const std::string &out_dir, size_t &out_class
                     int32_t foff = 0;
                     read_val(field + g_uobj.off_fprop_offset, foff);
 
-                    // Try reading FFieldClass name
                     std::string ftype = "Property";
                     uintptr_t fcls = 0;
                     if (read_val(field + g_uobj.off_ffield_class, fcls) && is_readable(fcls, 16)) {
@@ -1089,18 +1192,53 @@ static size_t dump_objects_and_sdk(const std::string &out_dir, size_t &out_class
                     read_val(field + g_uobj.off_ffield_next, next);
                     field = next;
                 }
+
+                // Also walk UField* Children for UFunctions on this class
+                uintptr_t uchild = 0;
+                read_val(obj + g_uobj.off_children, uchild);
+                int fn_safety = 0;
+                bool any_fn = false;
+                while (uchild && is_readable(uchild, 64) && fn_safety++ < 512) {
+                    std::string ctype = get_object_base_name(get_object_class(uchild));
+                    std::string cname = get_object_name(uchild);
+                    if (ctype == "Function" && !cname.empty()) {
+                        if (!any_fn) { fprintf(fsdk, "\n\t// Functions\n"); any_fn = true; }
+                        uintptr_t fn_va = 0;
+                        if (g_uobj.off_ufunc_ptr) read_val(uchild + g_uobj.off_ufunc_ptr, fn_va);
+#if defined(__aarch64__)
+                        fn_va &= 0x00FFFFFFFFFFFFFFULL;
+#endif
+                        uintptr_t rva = is_ue4_code_ptr(fn_va) ? (fn_va - g_lib_base) : 0;
+                        fprintf(fsdk, "\tvoid %s(); // RVA: 0x%llx VA: 0x%llx\n",
+                                cname.c_str(), (unsigned long long)rva, (unsigned long long)fn_va);
+                    }
+                    uintptr_t next = 0;
+                    read_val(uchild + g_uobj.off_ufield_next, next);
+                    uchild = next;
+                }
             } else {
                 uintptr_t field = 0;
                 read_val(obj + g_uobj.off_children, field);
                 int safety = 0;
                 while (field && is_readable(field, 80) && safety++ < 512) {
                     std::string fname = get_object_name(field);
-                    std::string ftype = get_object_name(get_object_class(field));
+                    std::string ftype = get_object_base_name(get_object_class(field));
                     int32_t foff = 0;
                     read_val(field + g_uobj.off_uprop_offset, foff);
-                    if (!fname.empty() && ftype != "Function") {
-                        fprintf(fsdk, "\t%-24s %-32s; // Offset: 0x%x\n",
-                                ftype.c_str(), fname.c_str(), foff);
+                    if (!fname.empty()) {
+                        if (ftype == "Function") {
+                            uintptr_t fn_va = 0;
+                            if (g_uobj.off_ufunc_ptr) read_val(field + g_uobj.off_ufunc_ptr, fn_va);
+#if defined(__aarch64__)
+                            fn_va &= 0x00FFFFFFFFFFFFFFULL;
+#endif
+                            uintptr_t rva = is_ue4_code_ptr(fn_va) ? (fn_va - g_lib_base) : 0;
+                            fprintf(fsdk, "\tvoid %s(); // Function RVA: 0x%llx VA: 0x%llx\n",
+                                    fname.c_str(), (unsigned long long)rva, (unsigned long long)fn_va);
+                        } else {
+                            fprintf(fsdk, "\t%-24s %-32s; // Offset: 0x%x\n",
+                                    ftype.c_str(), fname.c_str(), foff);
+                        }
                     }
                     uintptr_t next = 0;
                     read_val(field + g_uobj.off_ufield_next, next);
@@ -1114,6 +1252,11 @@ static size_t dump_objects_and_sdk(const std::string &out_dir, size_t &out_class
 
     if (fobj) fclose(fobj);
     if (fsdk) fclose(fsdk);
+    if (ffn) fclose(ffn);
+    if (fjs) {
+        fprintf(fjs, "\n]}\n");
+        fclose(fjs);
+    }
     return obj_count;
 }
 
@@ -1121,13 +1264,13 @@ static void dump_ue4_so_memory(const std::string &out_dir) {
     std::string path = out_dir + "/libUE4_mem.so";
     FILE *f = fopen(path.c_str(), "wb");
     if (!f) return;
-    dumper::log("[UE4] Dumping libUE4.so memory (%zu MB)...", g_lib_size / (1024 * 1024));
-    dumper::set_status_detail("UE4: dumping libUE4 memory (0/%zu MB)", g_lib_size / (1024 * 1024));
+    dumper::log("[UE4] Dumping engine .so memory (%zu MB)...", g_lib_size / (1024 * 1024));
+    dumper::set_status_detail("UE4: dumping engine memory (0/%zu MB)", g_lib_size / (1024 * 1024));
     std::vector<char> page(4096);
     size_t zero_pages = 0;
     for (size_t off = 0; off < g_lib_size; off += 4096) {
         if ((off & 0x1FFFFFF) == 0)  // every 32 MB
-            dumper::set_status_detail("UE4: dumping libUE4 memory (%zu/%zu MB)", off / (1024 * 1024),
+            dumper::set_status_detail("UE4: dumping engine memory (%zu/%zu MB)", off / (1024 * 1024),
                                       g_lib_size / (1024 * 1024));
         size_t n = std::min<size_t>(4096, g_lib_size - off);
         bool ok = dumper::safe_read(g_lib_base + off, page.data(), n);
@@ -1199,10 +1342,10 @@ bool dump_ue4(const Config &cfg, const std::string &package, uintptr_t lib_base,
 
     std::string out_dir = dumper::output_dir();
     refresh_maps();
-    dumper::log("[UE4] libUE4.so base=0x%llx size=0x%zx, writable memory=%zu MB",
+    dumper::log("[UE4] Engine lib base=0x%llx size=0x%zx, writable memory=%zu MB",
                 (unsigned long long)g_lib_base, g_lib_size, rw_bytes() / (1024 * 1024));
     if (!g_lib_base)
-        dumper::log("[UE4] WARNING: libUE4.so base is 0 - RVAs from config.txt cannot be resolved");
+        dumper::log("[UE4] WARNING: Engine lib base is 0 - RVAs from config.txt cannot be resolved");
 
     // Manual GNames from config.txt: dump names right away instead of waiting.
     dumper::set_status_detail("UE4: applying GNames offset...");
@@ -1232,9 +1375,17 @@ bool dump_ue4(const Config &cfg, const std::string &package, uintptr_t lib_base,
     }
 
     if (guobj_ok) {
-        dumper::set_status_detail("UE4: calibrating UStruct offsets...");
+        dumper::set_status_detail("UE4: calibrating UStruct & UFunction offsets...");
         calibrate_ustruct_offsets();
         apply_manual_uobject_offsets(cfg);
+        if (g_names.mode == GNamesMode::TNameEntryArray) {
+            dumper::set_engine_version("UE 4.11-4.22 (TNameEntryArray)");
+        } else if (g_uobj.use_ffield) {
+            dumper::set_engine_version(g_uobj.fname_has_number ? "UE 4.25+ / UE5 (FField)"
+                                                               : "UE5 (Outline FName + FField)");
+        } else {
+            dumper::set_engine_version("UE 4.23-4.24 (FNamePool + UField)");
+        }
     } else {
         dumper::log("[UE4] GUObjectArray not found - ObjectsDump/SDK skipped. Set ue4_guobjectarray=<RVA or VA> in config.txt");
     }
@@ -1246,11 +1397,12 @@ bool dump_ue4(const Config &cfg, const std::string &package, uintptr_t lib_base,
     dump_offsets_info(out_dir);
 
     if (guobj_ok && (cfg.dump_cs || cfg.dump_script_json)) {
-        dumper::set_status_detail("UE4: dumping GUObjectArray & SDK...");
-        dumper::log("[UE4] Dumping GUObjectArray & SDK classes (%d objects)...", g_uobj.num_elements);
-        size_t n_classes = 0;
-        size_t n_objs = dump_objects_and_sdk(out_dir, n_classes);
+        dumper::set_status_detail("UE4: dumping GUObjectArray, Functions & SDK...");
+        dumper::log("[UE4] Dumping GUObjectArray, Functions & SDK (%d objects)...", g_uobj.num_elements);
+        size_t n_classes = 0, n_funcs = 0;
+        size_t n_objs = dump_objects_and_sdk(cfg, out_dir, n_classes, n_funcs);
         dumper::log("[UE4] Dumped %zu UObjects -> ObjectsDump.txt", n_objs);
+        dumper::log("[UE4] Dumped %zu UFunctions -> FunctionsDump.txt / script.json", n_funcs);
         dumper::log("[UE4] Dumped %zu SDK Classes/Structs -> SDK_Dump.hpp", n_classes);
     }
 
